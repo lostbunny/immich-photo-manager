@@ -5,7 +5,10 @@ import sys
 
 
 def main():
-    transport = os.environ.get("MCP_TRANSPORT", "http").lower()
+    # Default to stdio + loopback host for safer local-only operation.
+    # Override with MCP_TRANSPORT=http and MCP_HOST=0.0.0.0 if you really
+    # want to expose the server on the LAN.
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
 
     if transport == "stdio":
         from .server import mcp
@@ -13,7 +16,7 @@ def main():
     else:
         import uvicorn
         port = int(os.environ.get("MCP_PORT", "8626"))
-        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        host = os.environ.get("MCP_HOST", "127.0.0.1")
         print(f"Immich MCP Server starting on {host}:{port}")
         uvicorn.run(
             "immich_mcp_server.server:app",
