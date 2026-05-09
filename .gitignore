@@ -8,3 +8,6 @@ __pycache__/
 immich-mcp-server
 scripts/location_inventory.json
 drolosoft-update-prompt.md
+
+# local dev venv
+.venv/

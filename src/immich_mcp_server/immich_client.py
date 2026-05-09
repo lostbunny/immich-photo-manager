@@ -6,6 +6,7 @@ Wraps the Immich API endpoints needed for photo management.
 import base64
 import json
 import os
+import subprocess
 import httpx
 from pathlib import Path
 from typing import Any
@@ -17,18 +18,28 @@ class ImmichClient:
     # Class-level cache dir, resolved once
     _cache_dir: str | None = None
 
+    # Keyring service name used when CRED_SOURCE=keyring (Linux / secret-tool)
+    _KEYRING_SERVICE = "immich-mcp"
+
     def __init__(self):
         config = self._load_config_override()
+        keyring = self._load_from_keyring()
         self.base_url = (
-            config.get("base_url") or os.environ.get("IMMICH_BASE_URL", "")
+            config.get("base_url")
+            or keyring.get("base_url")
+            or os.environ.get("IMMICH_BASE_URL", "")
         ).rstrip("/")
         self.api_key = (
-            config.get("api_key") or os.environ.get("IMMICH_API_KEY", "")
+            config.get("api_key")
+            or keyring.get("api_key")
+            or os.environ.get("IMMICH_API_KEY", "")
         )
         if not self.base_url or not self.api_key:
             raise ValueError(
-                "IMMICH_BASE_URL and IMMICH_API_KEY environment variables are required. "
-                "You can also set them via the update_credentials MCP tool."
+                "Immich credentials missing. Provide IMMICH_BASE_URL and "
+                "IMMICH_API_KEY via env vars, set CRED_SOURCE=keyring with "
+                "secret-tool entries under service='immich-mcp', or use the "
+                "update_credentials MCP tool."
             )
         self._headers = {
             "x-api-key": self.api_key,
@@ -69,6 +80,36 @@ class ImmichClient:
         if not cache_dir:
             return None
         return os.path.join(cache_dir, "config.json")
+
+    @classmethod
+    def _load_from_keyring(cls) -> dict:
+        """Optionally load credentials from GNOME Keyring via secret-tool.
+
+        Only runs when CRED_SOURCE=keyring is set. Returns an empty dict on
+        any error (missing tool, no entries, etc.) so the caller can fall
+        back to env vars or the override file.
+        """
+        if os.environ.get("CRED_SOURCE", "").lower() != "keyring":
+            return {}
+
+        def _lookup(field: str) -> str:
+            try:
+                r = subprocess.run(
+                    [
+                        "secret-tool", "lookup",
+                        "service", cls._KEYRING_SERVICE,
+                        "username", field,
+                    ],
+                    capture_output=True, text=True, check=True, timeout=5,
+                )
+                return r.stdout.strip()
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                return ""
+
+        return {
+            "base_url": _lookup("base_url"),
+            "api_key": _lookup("api_key"),
+        }
 
     @classmethod
     def _load_config_override(cls) -> dict:
