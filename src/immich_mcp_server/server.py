@@ -6,6 +6,7 @@ License: MIT
 """
 
 import json
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -17,14 +18,30 @@ from .immich_client import ImmichClient
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
-    """Initialize the Immich client on server startup."""
-    client = ImmichClient()
-    # Verify connection at startup
-    try:
-        await client.ping()
-    except Exception as e:
-        print(f"Warning: Could not connect to Immich at {client.base_url}: {e}")
-    yield {"immich": client}
+    """Load every Immich account from the keyring; activate the default."""
+    accounts = ImmichClient.load_all_accounts()  # may raise RuntimeError
+    default_name = os.environ.get("IMMICH_DEFAULT_ACCOUNT", "")
+    active_name = default_name if default_name in accounts else None
+
+    if active_name:
+        try:
+            await accounts[active_name].ping()
+        except Exception as e:
+            print(
+                f"Warning: Could not connect to Immich for account "
+                f"'{active_name}' at {accounts[active_name].base_url}: {e}"
+            )
+    elif default_name:
+        print(
+            f"Warning: IMMICH_DEFAULT_ACCOUNT='{default_name}' not found in "
+            f"keyring. No active account; tools will error until "
+            f"switch_account() is called. Available: {list(accounts)}"
+        )
+
+    yield {
+        "accounts": accounts,
+        "active": active_name,
+    }
 
 
 mcp = FastMCP(
@@ -35,8 +52,15 @@ mcp = FastMCP(
 
 
 def _client(ctx: Context) -> ImmichClient:
-    """Get the Immich client from the request context."""
-    return ctx.request_context.lifespan_context["immich"]
+    """Get the currently active Immich client."""
+    state = ctx.request_context.lifespan_context
+    active = state.get("active")
+    if not active:
+        raise RuntimeError(
+            "No active Immich account. Call list_accounts() to see options, "
+            "then switch_account(name)."
+        )
+    return state["accounts"][active]
 
 
 # ── Health & Stats ──────────────────────────────────────────
@@ -63,87 +87,79 @@ async def get_statistics(ctx: Context) -> str:
     return json.dumps(result)
 
 
-# ── Credential Management ──────────────────────────────────
+# ── Account Management ────────────────────────────────────
 
 
 @mcp.tool()
-async def update_credentials(ctx: Context, base_url: str, api_key: str) -> str:
-    """Update the Immich connection credentials. Use this when the API key
-    has been rotated or when the server URL has changed. The new credentials
-    are persisted to disk and take effect immediately — no restart required.
+async def list_accounts(ctx: Context) -> str:
+    """List all configured Immich accounts and the currently active one."""
+    state = ctx.request_context.lifespan_context
+    accounts = state["accounts"]
+    return json.dumps({
+        "active": state.get("active"),
+        "available": [
+            {"name": name, "base_url": client.base_url}
+            for name, client in accounts.items()
+        ],
+    })
+
+
+@mcp.tool()
+async def current_account(ctx: Context) -> str:
+    """Return the currently active Immich account name and base URL."""
+    state = ctx.request_context.lifespan_context
+    active = state.get("active")
+    if not active:
+        return json.dumps({"active": None, "base_url": None})
+    client = state["accounts"][active]
+    return json.dumps({"active": active, "base_url": client.base_url})
+
+
+@mcp.tool()
+async def switch_account(ctx: Context, account: str) -> str:
+    """Switch the active Immich account for the rest of this MCP session.
+
+    The new account must already be loaded from the keyring. Restart reverts
+    to the launcher's IMMICH_DEFAULT_ACCOUNT.
 
     Args:
-        base_url: The Immich server URL (e.g. 'https://photos.example.com').
-        api_key: A valid Immich API key.
+        account: The account name (see list_accounts()).
     """
-    # 1. Create a new client with the provided credentials to validate them
-    import os
-    old_base = os.environ.get("IMMICH_BASE_URL", "")
-    old_key = os.environ.get("IMMICH_API_KEY", "")
-
-    try:
-        # Temporarily set env vars so ImmichClient can init
-        # (the config.json override hasn't been written yet)
-        os.environ["IMMICH_BASE_URL"] = base_url
-        os.environ["IMMICH_API_KEY"] = api_key
-        new_client = ImmichClient()
-    except Exception as e:
-        # Restore old env vars
-        os.environ["IMMICH_BASE_URL"] = old_base
-        os.environ["IMMICH_API_KEY"] = old_key
+    state = ctx.request_context.lifespan_context
+    accounts = state["accounts"]
+    if account not in accounts:
         return json.dumps({
             "success": False,
-            "error": f"Invalid credentials: {e}",
+            "error": f"Unknown account '{account}'. Available: {list(accounts)}",
         })
 
-    # 2. Verify the new credentials actually work
+    candidate = accounts[account]
     try:
-        await new_client.ping()
+        await candidate.ping()
     except Exception as e:
-        os.environ["IMMICH_BASE_URL"] = old_base
-        os.environ["IMMICH_API_KEY"] = old_key
         return json.dumps({
             "success": False,
             "error": (
-                f"Could not connect to Immich at {base_url}: {e}. "
-                "Check the URL and API key are correct."
+                f"Could not connect to Immich for account '{account}' at "
+                f"{candidate.base_url}: {e}. Active account unchanged."
             ),
         })
 
-    # 3. Persist to cache dir so they survive restarts
+    state["active"] = account
     try:
-        config_path = ImmichClient.save_config(base_url, api_key)
-    except RuntimeError as e:
-        # Credentials work but can't persist — still swap the live client
-        config_path = None
-
-    # 4. Hot-swap the live client (no restart needed)
-    ctx.request_context.lifespan_context["immich"] = new_client
-
-    # 5. Get stats to confirm everything works
-    try:
-        stats = await new_client.get_statistics()
-        photo_count = stats.get("photos", 0)
-        video_count = stats.get("videos", 0)
+        stats = await candidate.get_statistics()
+        photos = stats.get("photos", "?")
+        videos = stats.get("videos", "?")
     except Exception:
-        photo_count = "?"
-        video_count = "?"
+        photos = videos = "?"
 
-    result = {
+    return json.dumps({
         "success": True,
-        "base_url": base_url,
-        "photos": photo_count,
-        "videos": video_count,
-    }
-    if config_path:
-        result["persisted_to"] = config_path
-    else:
-        result["warning"] = (
-            "Credentials updated for this session but could NOT be persisted to disk. "
-            "They will be lost on restart."
-        )
-
-    return json.dumps(result, default=str)
+        "active": account,
+        "base_url": candidate.base_url,
+        "photos": photos,
+        "videos": videos,
+    })
 
 
 # ── Asset Info ──────────────────────────────────────────────
