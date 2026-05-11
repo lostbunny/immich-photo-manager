@@ -5,145 +5,107 @@ Wraps the Immich API endpoints needed for photo management.
 
 import base64
 import json
-import os
 import subprocess
 import httpx
-from pathlib import Path
 from typing import Any
+
+
+KEYRING_SERVICE = "immich-mcp"
 
 
 class ImmichClient:
     """Async HTTP client for the Immich REST API."""
 
-    # Class-level cache dir, resolved once
-    _cache_dir: str | None = None
+    KEYRING_SERVICE = KEYRING_SERVICE
 
-    # Keyring service name used when CRED_SOURCE=keyring (Linux / secret-tool)
-    _KEYRING_SERVICE = "immich-mcp"
-
-    def __init__(self):
-        config = self._load_config_override()
-        keyring = self._load_from_keyring()
-        self.base_url = (
-            config.get("base_url")
-            or keyring.get("base_url")
-            or os.environ.get("IMMICH_BASE_URL", "")
-        ).rstrip("/")
-        self.api_key = (
-            config.get("api_key")
-            or keyring.get("api_key")
-            or os.environ.get("IMMICH_API_KEY", "")
-        )
-        if not self.base_url or not self.api_key:
-            raise ValueError(
-                "Immich credentials missing. Provide IMMICH_BASE_URL and "
-                "IMMICH_API_KEY via env vars, set CRED_SOURCE=keyring with "
-                "secret-tool entries under service='immich-mcp', or use the "
-                "update_credentials MCP tool."
-            )
+    def __init__(self, base_url: str, api_key: str):
+        if not base_url or not api_key:
+            raise ValueError("base_url and api_key are required")
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
         self._headers = {
             "x-api-key": self.api_key,
             "Accept": "application/json",
         }
 
-    # ── Config override (writable cache) ────────────────────
+    # ── Multi-account loading from GNOME Keyring ────────────
 
     @classmethod
-    def _find_cache_dir(cls) -> str | None:
-        """Find the writable .mcpb-cache directory.
+    def load_all_accounts(cls) -> dict[str, "ImmichClient"]:
+        """Enumerate every keyring entry with service=immich-mcp and build
+        a {account_name: ImmichClient} dict.
 
-        Resolution order:
-        1. IMMICH_CACHE_DIR env var (set in mcp.json) — accepted even if
-           the directory doesn't exist yet (save_config will create it).
-        2. Relative to this module: ../../.mcpb-cache/
+        Raises RuntimeError if no entries are found (fail-fast on fresh
+        install — the operator must store at least one account first).
         """
-        if cls._cache_dir is not None:
-            return cls._cache_dir
-
-        # 1. Explicit env var (accept path even if dir doesn't exist yet)
-        env_dir = os.environ.get("IMMICH_CACHE_DIR", "")
-        if env_dir:
-            cls._cache_dir = os.path.realpath(env_dir)
-            return cls._cache_dir
-
-        # 2. Relative to module: src/immich_mcp_server/ -> ../../.mcpb-cache/
-        module_dir = Path(__file__).resolve().parent
-        cache_candidate = module_dir / ".." / ".." / ".mcpb-cache"
-        # Accept even if it doesn't exist yet
-        cls._cache_dir = str(cache_candidate.resolve())
-        return cls._cache_dir
-
-    @classmethod
-    def _config_path(cls) -> str | None:
-        """Return the path to the config override file, or None."""
-        cache_dir = cls._find_cache_dir()
-        if not cache_dir:
-            return None
-        return os.path.join(cache_dir, "config.json")
-
-    @classmethod
-    def _load_from_keyring(cls) -> dict:
-        """Optionally load credentials from GNOME Keyring via secret-tool.
-
-        Only runs when CRED_SOURCE=keyring is set. Returns an empty dict on
-        any error (missing tool, no entries, etc.) so the caller can fall
-        back to env vars or the override file.
-        """
-        if os.environ.get("CRED_SOURCE", "").lower() != "keyring":
-            return {}
-
-        def _lookup(field: str) -> str:
-            try:
-                r = subprocess.run(
-                    [
-                        "secret-tool", "lookup",
-                        "service", cls._KEYRING_SERVICE,
-                        "username", field,
-                    ],
-                    capture_output=True, text=True, check=True, timeout=5,
-                )
-                return r.stdout.strip()
-            except (subprocess.SubprocessError, FileNotFoundError, OSError):
-                return ""
-
+        raw = cls._secret_tool_search()
+        parsed = cls._parse_keyring_search_output(raw)
+        if not parsed:
+            raise RuntimeError(
+                "No Immich keyring entries found. Store at least one with: "
+                "secret-tool store --label='Immich' service immich-mcp "
+                "account <name> base_url <url>"
+            )
         return {
-            "base_url": _lookup("base_url"),
-            "api_key": _lookup("api_key"),
+            name: cls(base_url=attrs["base_url"], api_key=attrs["api_key"])
+            for name, attrs in parsed.items()
+            if attrs.get("base_url") and attrs.get("api_key")
         }
 
     @classmethod
-    def _load_config_override(cls) -> dict:
-        """Load credential overrides from .mcpb-cache/config.json if it exists."""
-        config_path = cls._config_path()
-        if not config_path or not os.path.exists(config_path):
-            return {}
-        try:
-            with open(config_path) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
+    def _secret_tool_search(cls) -> str:
+        """Run `secret-tool search --all service immich-mcp` and return stdout."""
+        r = subprocess.run(
+            ["secret-tool", "search", "--all", "service", cls.KEYRING_SERVICE],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+        return r.stdout
 
-    @classmethod
-    def save_config(cls, base_url: str, api_key: str) -> str:
-        """Save credentials to the writable cache dir.
+    @staticmethod
+    def _parse_keyring_search_output(text: str) -> dict[str, dict]:
+        """Parse `secret-tool search --all` output into {account: {base_url, api_key}}.
 
-        Creates the directory if it doesn't exist.
-        Returns the path written, or raises if it cannot be created.
+        Each result block looks like:
+            [/org/freedesktop/secrets/collection/login/123]
+            label = Immich API key (account=tasha)
+            secret = <api_key value>
+            created = ...
+            modified = ...
+            schema = org.freedesktop.Secret.Generic
+            attribute.account = tasha
+            attribute.base_url = https://photos.example.com
+            attribute.service = immich-mcp
+
+        Blocks are separated by a blank line or by a new `[/org/...]` header.
+        Blocks missing `attribute.account` are silently skipped.
         """
-        config_path = cls._config_path()
-        if not config_path:
-            raise RuntimeError(
-                "No cache directory path could be determined. "
-                "Cannot persist credentials."
-            )
-        # Create the cache directory if it doesn't exist
-        cache_dir = os.path.dirname(config_path)
-        os.makedirs(cache_dir, exist_ok=True)
-        config = {"base_url": base_url, "api_key": api_key}
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
-        os.chmod(config_path, 0o600)
-        return config_path
+        accounts: dict[str, dict] = {}
+        current: dict = {}
+
+        def _flush():
+            if current.get("account"):
+                accounts[current["account"]] = {
+                    "base_url": current.get("base_url", ""),
+                    "api_key":  current.get("api_key",  ""),
+                }
+
+        for line in text.splitlines():
+            line = line.rstrip()
+            if not line or line.startswith("["):
+                _flush()
+                current = {}
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key == "secret":
+                current["api_key"] = value
+            elif key == "attribute.account":
+                current["account"] = value
+            elif key == "attribute.base_url":
+                current["base_url"] = value
+        _flush()
+        return accounts
 
     # ── HTTP ────────────────────────────────────────────────
 
