@@ -54,10 +54,21 @@ class ImmichClient:
 
     @classmethod
     def _secret_tool_search(cls) -> str:
-        """Run `secret-tool search --all service immich-mcp` and return stdout."""
+        """Run `secret-tool search --all service immich-mcp` and return the
+        combined stdout+stderr.
+
+        secret-tool writes the per-result block headers, label, and `secret`
+        to stdout but the `attribute.*` lines to stderr. We need both, and
+        they're emitted in interleaved order per result, so STDOUT capture
+        with stderr=STDOUT preserves the grouping.
+        """
         r = subprocess.run(
             ["secret-tool", "search", "--all", "service", cls.KEYRING_SERVICE],
-            capture_output=True, text=True, check=False, timeout=5,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=5,
         )
         return r.stdout
 
